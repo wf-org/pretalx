@@ -1,3 +1,5 @@
+import logging
+
 from django.dispatch import receiver
 from django.templatetags.static import static
 from django.urls import resolve, reverse
@@ -7,11 +9,16 @@ from django.utils.translation import gettext
 from django.utils.translation import gettext_lazy as _
 
 from pretalx.cfp.signals import html_head
+from pretalx.common.exceptions import SubmissionError
 from pretalx.common.signals import activitylog_display
-from pretalx.orga.signals import nav_event
+from pretalx.orga.signals import dashboard_tile, html_above_orga_page, nav_event
+from pretalx.submission.signals import before_submission_state_change
 
+from . import ticket_guard, tickets
 from .oidc import is_configured
 from .orga_views import VIEW_PERMISSION
+
+logger = logging.getLogger(__name__)
 
 LOGIN_URL_NAMES = {"event.login"}
 
@@ -125,3 +132,109 @@ def display_log_entry(sender, activitylog, **kwargs):
             )
         return gettext("An existing speaker account was linked to a pretix account.")
     return LOG_ACTIONS.get(action)
+
+
+# Accepting a proposal needs a covered speaker (ticket_guard). Blocking the
+# step into "accepted" (or straight into "confirmed") keeps ticketless
+# proposals out of the schedule: a released schedule shows confirmed ones only.
+ACCEPTED_STATES = ("accepted", "confirmed")
+
+
+@receiver(before_submission_state_change, dispatch_uid="pretix_sso_require_ticket")
+def require_ticket_to_accept(sender, submission, new_state, user=None, **kwargs):
+    if new_state not in ACCEPTED_STATES or not tickets.is_configured():
+        return
+    # Organisers creating an already-accepted proposal: pretalx asks before the
+    # speakers are added, so there is nothing to check yet; the banner and the
+    # dashboard tile show it afterwards
+    if submission._state.adding:
+        return
+    if submission.state in ACCEPTED_STATES:
+        return
+    message = ticket_guard.refusal(sender, submission)
+    if message:
+        raise SubmissionError(message)
+
+
+INACTIVE_STATES = ("rejected", "withdrawn", "canceled", "deleted", "draft")
+
+
+@receiver(html_above_orga_page, dispatch_uid="pretix_sso_ticket_banner")
+def ticket_banner(sender, request, **kwargs):
+    """A warning on a proposal's organiser pages when no speaker is covered.
+    Uses the cached ticket data; fetches from pretix only when nothing is
+    cached (at most once an hour per web process)."""
+    match = getattr(request, "resolver_match", None)
+    code = match.kwargs.get("code") if match else None
+    if (
+        not code
+        or not (match.url_name or "").startswith("submissions.")
+        or not tickets.is_configured()
+        or not request.user.has_perm(VIEW_PERMISSION, sender)
+    ):
+        return ""
+    submission = sender.submissions.filter(code__iexact=code).first()
+    if submission is None or submission.state in INACTIVE_STATES:
+        return ""
+    tickets_url = reverse(
+        "plugins:pretalx_pretix_sso:tickets", kwargs={"event": sender.slug}
+    )
+    try:
+        covered = ticket_guard.is_covered(sender, submission, fetch_missing=True)
+    except tickets.LOOKUP_ERRORS:
+        return format_html(
+            '<div class="alert alert-warning"><div>{} <a href="{}">{}</a></div></div>',
+            gettext(
+                "The pretix tickets of this proposal's speakers could not be checked."
+            ),
+            tickets_url,
+            gettext("pretix tickets"),
+        )
+    if covered:
+        return ""
+    return format_html(
+        '<div class="alert alert-danger"><div>{} <a href="{}">{}</a></div></div>',
+        gettext("No speaker of this proposal has a paid pretix ticket."),
+        tickets_url,
+        gettext("pretix tickets"),
+    )
+
+
+@receiver(dashboard_tile, dispatch_uid="pretix_sso_ticket_tile")
+def ticket_tile(sender, **kwargs):
+    """Accepted and confirmed sessions without a covered speaker. pretalx adds
+    whatever a receiver returns, errors included, so this never raises."""
+    try:
+        if not tickets.is_configured():
+            return []
+        sessions = list(
+            sender.submissions.filter(state__in=ACCEPTED_STATES).prefetch_related(
+                "speakers__user__pretix_customer"
+            )
+        )
+        url = reverse(
+            "plugins:pretalx_pretix_sso:tickets", kwargs={"event": sender.slug}
+        )
+        missing = ticket_guard.uncovered(sender, sessions)
+    except tickets.LOOKUP_ERRORS:
+        return [
+            {
+                "large": "?",
+                "small": gettext("pretix tickets could not be checked"),
+                "url": url,
+                "priority": 40,
+            }
+        ]
+    except Exception:
+        logger.warning("pretix ticket dashboard tile failed", exc_info=True)
+        return []
+    if not missing:
+        return []
+    return [
+        {
+            "large": len(missing),
+            "small": gettext("accepted sessions without a pretix ticket"),
+            "url": url,
+            "priority": 15,
+        }
+    ]

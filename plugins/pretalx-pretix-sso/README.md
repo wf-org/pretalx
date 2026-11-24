@@ -79,6 +79,32 @@ pretix_url = https://pretix.eu
 organizer = myorg
 ```
 
+## Acceptance needs a ticket
+
+While the ticket check is configured, a proposal can only be accepted (or set
+straight to confirmed) when one of its speakers holds a paid ticket or is
+marked as covered on the pretix tickets page. Otherwise pretalx refuses the
+change with a message, in single and bulk state changes and in the API, so the
+session can't reach a released schedule (which shows confirmed sessions only).
+Accepted proposals can still be confirmed, and other changes aren't affected.
+
+The check uses the cached ticket data; when that says "no ticket" and is more
+than a minute old, it asks pretix again first (at most once a minute, also for
+bulk changes), so a speaker who has just bought a ticket isn't refused. If
+pretix can't be reached, acceptance is refused with a message saying so.
+Proposals that organisers create directly as accepted are not checked, since
+pretalx asks before their speakers are added; the banner and tile below show
+them.
+
+Also in the organiser area, from the cached ticket data; when nothing is
+cached (the cache lasts an hour, and in production each web task has its own),
+the page fetches from pretix first. If pretix can't be reached, they say so:
+
+- a red banner on a proposal's pages when no speaker is covered (not for
+  rejected, withdrawn, cancelled or deleted proposals);
+- a dashboard tile with the number of accepted and confirmed sessions without
+  a covered speaker, linking to the pretix tickets page.
+
 ## Secrets from the environment
 
 Every setting above can also come from an environment variable named
